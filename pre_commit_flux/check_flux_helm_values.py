@@ -21,6 +21,20 @@ def main():
         _printErrors()
         exit(1)
 
+def _isSupportedRepo(definition):
+    return _isSupportedChartRepo(definition) or _isSupportedChartRefRepo(definition)
+
+def _isSupportedChartRepo(definition):
+    return _isSupportedKind(definition, ["HelmRepository"])
+
+def _isSupportedChartRefRepo(definition):
+    return _isSupportedKind(definition, ["OCIRepository"])
+
+def _isHelmRelease(definition):
+    return _isSupportedKind(definition, ["HelmRelease"])
+
+def _isSupportedKind(definition, supportedKinds):
+    return definition and "kind" in definition and definition["kind"] in supportedKinds
 
 def _buildRepoMap():
     repos = {}
@@ -28,14 +42,18 @@ def _buildRepoMap():
         with open(file) as f:
             try:
                 for definition in yaml.load_all(f, Loader=yaml.SafeLoader):
-                    if (
-                        not definition
-                        or "kind" not in definition
-                        or definition["kind"] != "HelmRepository"
-                    ):
+                    if _isSupportedChartRepo(definition):
+                        repoName = definition["metadata"]["name"]
+                        repos[repoName] = [definition["spec"]["url"], None]
+                    elif _isSupportedChartRefRepo(definition):
+                        repoName = definition["metadata"]["name"]
+                        if "ref" not in definition["spec"] or "tag" not in definition["spec"]["ref"]:
+                            continue
+                        repos[repoName] = [definition["spec"]["url"], definition["spec"]["ref"]["tag"]]
+                    else:
                         continue
-                    repoName = definition["metadata"]["name"]
-                    repos[repoName] = definition["spec"]["url"]
+                    if not _isSupportedRepo(definition):
+                        continue
             except Exception:
                 continue
 
@@ -45,36 +63,39 @@ def _buildRepoMap():
 def _validateFile(fileToValidate, repos):
     with open(fileToValidate) as f:
         for definition in yaml.load_all(f, Loader=yaml.SafeLoader):
-            if (
-                not definition
-                or "kind" not in definition
-                or definition["kind"] != "HelmRelease"
-            ):
+            if not _isHelmRelease(definition):
                 continue
 
+            chartName = None
             try:
                 chartSpec = definition["spec"]["chart"]["spec"]
-            
+                if not _isSupportedChartRepo(chartSpec["sourceRef"]):
+                    continue
+                chartName = chartSpec["chart"]
+                chartVersion = chartSpec["version"]
+                chartUrl = repos[chartSpec["sourceRef"]["name"]][0]
+                if chartUrl.startswith("oci://"):
+                    if not chartUrl.endswith("/"):
+                        chartUrl += "/"
+                    chartUrl += chartName
+                    chartName = None
             except KeyError as e:
                 if definition["spec"]["chartRef"]:
-                    print("Cannot validate OCI-based charts, skipping")
-                    continue
+                    chartSpec = definition["spec"]["chartRef"]
+                    if not _isSupportedChartRefRepo(chartSpec):
+                        continue
+                    chartUrl, chartVersion = repos[chartSpec["name"]]
                 else:
                     raise e
-
-            if chartSpec["sourceRef"]["kind"] != "HelmRepository":
-                continue
-
-            chartName = chartSpec["chart"]
-            chartVersion = chartSpec["version"]
-            chartUrl = repos[chartSpec["sourceRef"]["name"]]
 
             with tempfile.TemporaryDirectory() as tmpDir:
                 with open(path.join(tmpDir, "values.yaml"), "w") as valuesFile:
                     if "spec" in definition and "values" in definition["spec"]:
                         yaml.dump(definition["spec"]["values"], valuesFile)
 
-                command = f"helm pull --repo {quote(chartUrl)} --version {quote(chartVersion)} {quote(chartName)}"
+                command = f"helm pull {quote(chartUrl)} --version {quote(chartVersion)}"
+                if chartName:
+                    command += f" {quote(chartName)}"
                 
                 res = subprocess.run(
                     command,
